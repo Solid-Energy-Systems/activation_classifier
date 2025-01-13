@@ -6,6 +6,8 @@ import numpy as np
 from collections import defaultdict
 from arrangement_puzzle.seating_puzzle import load_puzzle_from_disk
 from arrangement_puzzle.llm_parser import analyze_llm_output
+import h5py
+import json
 
 class ActivationDataset(Dataset):
     """
@@ -15,152 +17,123 @@ class ActivationDataset(Dataset):
         root_dirs (list of str): Directories containing activation and input data (e.g., ['train/activations']).
         layers_to_load (list of int): Indices of model layers to load activations from (e.g., [0, 1, 2]).
         sequence_length (int): Number of tokens to consider in the activation sequences.
-        puzzles_json_dir (str): Directory containing puzzle JSON files, used to load puzzle metadata.
-        tokenizer (transformers.PreTrainedTokenizer): Tokenizer for processing input text.
+        verbose (bool): If True, prints informational messages and warnings (default is True).
 
     Attributes:
         activations (list of torch.Tensor): Processed activation sequences for each sample.
         labels (torch.Tensor): Labels corresponding to the activation sequences.
         sequence_length (int): Configured sequence length for each activation sequence.
-        puzzles_json_dir (str): Path to the directory containing puzzle metadata.
-        tokenizer (transformers.PreTrainedTokenizer): Tokenizer instance used for text processing.
         layers_to_load (list of int): Layers selected for loading activations.
+        verbose (bool): Whether to print informational messages and warnings.
     """
-    def __init__(self, root_dirs, layers_to_load, sequence_length=200, puzzles_json_dir=None, tokenizer=None):
-        """
-        Args:
-            root_dirs (list of strings): Directories with all the data (e.g., ['train/activations']).
-            layers_to_load (list of ints): List of layer indices to load (e.g., [0, 1, 2]).
-            sequence_length (int): Number of tokens to consider from the end of the sequence.
-            puzzles_json_dir (string): Directory containing the puzzle JSON files (e.g., 'path/to/puzzles').
-            tokenizer: The tokenizer to use (needed for analyze_llm_output).
-        """
+    def __init__(self, 
+                 preprocessed_data_dir, 
+                 layers_to_load,
+                 sequence_length=200,
+                 verbose=True):
+        self.preprocessed_data_dir = preprocessed_data_dir
+        self.layers_to_load = layers_to_load
+        self.sequence_length = sequence_length
+        self.verbose = verbose
+
         self.activations = []
         self.labels = []
-        self.sequence_length = sequence_length
-        self.puzzles_json_dir = puzzles_json_dir
-        self.tokenizer = tokenizer
-        self.layers_to_load = layers_to_load
 
-        if not self.tokenizer:
-            raise ValueError("Tokenizer must be provided.")
+        # Iterate over preprocessed h5/json pairs
+        for file_name in os.listdir(self.preprocessed_data_dir):
+            if file_name.endswith('.h5'):
+                puzzle_id = file_name.replace('.h5', '')
+                h5_filepath = os.path.join(self.preprocessed_data_dir, file_name)
+                json_filepath = os.path.join(self.preprocessed_data_dir, f"{puzzle_id}.json")
 
-        for root_dir in root_dirs:
-            for subdir in os.listdir(root_dir):
-                subdir_path = os.path.join(root_dir, subdir)
-                if os.path.isdir(subdir_path):
-                    # Assume subdir name corresponds to the puzzle ID, e.g., '6000'
-                    puzzle_id = subdir
-                    puzzle_json_file = os.path.join(self.puzzles_json_dir, f"{puzzle_id}.json")
+                # Check for corresponding JSON
+                if not os.path.exists(json_filepath):
+                    if self.verbose:
+                        print(f"Warning: Missing JSON file for puzzle_id={puzzle_id}, skipping.")
+                    continue
 
-                    # Load the puzzle data
-                    if not os.path.exists(puzzle_json_file):
-                        print(f"Warning: Puzzle JSON file '{puzzle_json_file}' not found for puzzle ID '{puzzle_id}', skipping.")
-                        continue
+                # Load activation metadata
+                with h5py.File(h5_filepath, 'r') as hf:
+                    num_layers = hf.attrs['num_layers']
+                    num_tokens = hf.attrs['num_tokens']
 
-                    try:
-                        clues, correct_arrangement, name_color_mapping = load_puzzle_from_disk(puzzle_json_file)
-                    except Exception as e:
-                        print(f"Error loading puzzle JSON file '{puzzle_json_file}': {e}")
-                        continue
+                # Load precomputed tokenization and category info
+                with open(json_filepath, 'r') as jf:
+                    data = json.load(jf)
+                    input_string = data['input_string']
+                    input_ids = data['input_ids']
+                    token_dict = {int(k): v for k, v in data['token_dict'].items()}  # Convert keys to integers
 
-                    # Find the activation file and input string file
-                    activation_file = None
-                    input_string_file = None
-                    for file_name in os.listdir(subdir_path):
-                        if file_name == 'hidden_states.pt':
-                            activation_file = os.path.join(subdir_path, file_name)
-                        elif file_name == 'input.txt':
-                            input_string_file = os.path.join(subdir_path, file_name)
-                    if activation_file and input_string_file:
-                        # Load the activation data
-                        activation_data = torch.load(activation_file)  # Shape: [layers, tokens, hidden_size]
+                # Determine prompt length:
+                # You know from preprocessing how activations align with tokens.
+                # The original code excluded prompt tokens by comparing lengths.
+                # If we stored that information differently, we could just load it here.
+                # Assuming `num_tokens` is the number of tokens in activations:
+                num_prompt_tokens = len(input_ids) - num_tokens
+                if num_prompt_tokens < 0:
+                    # Inconsistent data, skip
+                    if self.verbose:
+                        print(f"Warning: negative prompt tokens for puzzle_id={puzzle_id}, skipping.")
+                    continue
 
-                        # Select specified layers
-                        activation_data = activation_data[self.layers_to_load, :, :]  # Shape: [num_layers, tokens, hidden_size]
+                # Construct category array for tokens corresponding to activations
+                # token_dict is keyed by token index in the full input sequence
+                # We need to map them to categories after the prompt.
+                token_categories = []
+                for idx in range(num_prompt_tokens, len(input_ids)):
+                    cat = token_dict.get(idx, 'unknown')
+                    token_categories.append(cat)
 
-                        num_layers, num_tokens_activation, hidden_size = activation_data.shape
+                # Now, load the required layers from the h5 file
+                # We'll load once and slice sequences.
+                with h5py.File(h5_filepath, 'r') as hf:
+                    # Stack the requested layers into a single tensor
+                    layer_data = []
+                    for lidx in self.layers_to_load:
+                        layer_data.append(hf[f"layer_{lidx}"][:])  # shape: [tokens, hidden_size]
+                    # layer_data: list of arrays, each [tokens, hidden_size]
+                    # Stack into a single array [num_layers, tokens, hidden_size]
+                    activation_data = torch.tensor(np.array(layer_data))
 
-                        # Load the input string
-                        with open(input_string_file, 'r') as f:
-                            input_string = f.read()
-
-                        # Generate the token_dict using analyze_llm_output
-                        try:
-                            token_dict, _ = analyze_llm_output(input_string, correct_arrangement, name_color_mapping, self.tokenizer)
-                        except Exception as e:
-                            print(f"Error analyzing LLM output for '{input_string_file}': {e}")
-                            continue
-
-                        # Tokenize the input string with offsets
-                        encoded = self.tokenizer(input_string, return_offsets_mapping=True, add_special_tokens=False)
-                        token_indices = list(range(len(encoded['input_ids'])))
-                        token_categories = [token_dict.get(idx, 'unknown') for idx in token_indices]
-
-                        num_tokens_tokenizer = len(encoded['input_ids'])
-
-                        # Exclude prompt tokens
-                        num_prompt_tokens = num_tokens_tokenizer - num_tokens_activation
-                        if num_prompt_tokens < 0:
-                            print(f"Warning: Number of prompt tokens is negative in '{activation_file}', skipping.")
-                            continue
-
-                        token_categories = token_categories[num_prompt_tokens:]
-
-                        # Ensure activations and token_categories are aligned
-                        if len(token_categories) != num_tokens_activation:
-                            print(f"Warning: After excluding prompt tokens, activation length ({num_tokens_activation}) does not match token length ({len(token_categories)}), skipping.")
-                            continue
-
-                        # At this point, len(token_categories) == num_tokens_activation
-                        # Proceed to find sequences of consecutive tokens with the same category
-                        idx_token = len(token_categories) - 1
-                        while idx_token >= 0:
-                            current_category = token_categories[idx_token]
-                            if current_category in ['solution_correct', 'solution_incorrect', 'clue_hallucination']:
-                                # Start collecting tokens
-                                end_idx = idx_token
-                                category_label = 1 if current_category == 'solution_correct' else 0
-                                while idx_token >= 0 and token_categories[idx_token] == current_category:
-                                    idx_token -= 1
-                                start_idx = idx_token + 1  # Index of the first token in this consecutive sequence
-                                seq_length = end_idx - start_idx + 1
-                                if seq_length >= self.sequence_length:
-                                    # Take the last 'sequence_length' tokens
-                                    seq_start = end_idx - self.sequence_length + 1
-                                    activation_seq = activation_data[:, seq_start:end_idx+1, :]  # Shape: [num_layers, sequence_length, hidden_size]
-                                    self.activations.append(activation_seq)
-                                    self.labels.append(category_label)
-                                else:
-                                    print(f"Warning: Consecutive token sequence length ({seq_length}) is less than {self.sequence_length} in '{activation_file}', category '{current_category}', skipping.")
-                            else:
-                                idx_token -= 1
+                # Find sequences of consecutive tokens with same category
+                idx_token = len(token_categories) - 1
+                while idx_token >= 0:
+                    current_category = token_categories[idx_token]
+                    if current_category in ['solution_correct', 'solution_incorrect', 'clue_hallucination']:
+                        end_idx = idx_token
+                        category_label = 1 if current_category == 'solution_correct' else 0
+                        # Move backwards until category changes
+                        while idx_token >= 0 and token_categories[idx_token] == current_category:
+                            idx_token -= 1
+                        start_idx = idx_token + 1
+                        seq_length = end_idx - start_idx + 1
+                        if seq_length >= self.sequence_length:
+                            seq_start = end_idx - self.sequence_length + 1
+                            activation_seq = activation_data[:, seq_start:end_idx+1, :]
+                            self.activations.append(activation_seq)
+                            self.labels.append(category_label)
+                        else:
+                            # skip sequence if shorter than required
+                            pass
                     else:
-                        if not activation_file:
-                            print(f"Warning: Activation file 'hidden_states.pt' not found in '{subdir_path}'.")
-                        if not input_string_file:
-                            print(f"Warning: Input string file not found in '{subdir_path}'.")
-        print(f"Loaded {len(self.activations)} activation sequences from directories: {root_dirs}.")
+                        idx_token -= 1
 
-        # Convert labels to tensor for efficient indexing
         self.labels = torch.tensor(self.labels, dtype=torch.float32)
-
-        # Calculate and print label counts
-        if len(self.labels) > 0:
-            num_correct = self.labels.sum().item()
-            num_incorrect = len(self.labels) - num_correct
-            print(f"Number of correct activations: {int(num_correct)}")
-            print(f"Number of incorrect activations: {int(num_incorrect)}")
-        else:
-            print("No activation sequences loaded.")
+        if self.verbose:
+            print(f"Loaded {len(self.activations)} activation sequences from: {self.preprocessed_data_dir}")
+            if len(self.labels) > 0:
+                num_correct = self.labels.sum().item()
+                num_incorrect = len(self.labels) - num_correct
+                print(f"Number of correct activations: {int(num_correct)}")
+                print(f"Number of incorrect activations: {int(num_incorrect)}")
+            else:
+                print("No activation sequences loaded.")
 
     def __len__(self):
         return len(self.activations)
     
     def __getitem__(self, idx):
-        activations = self.activations[idx]  # Shape: [num_layers, sequence_length, hidden_size]
-        label = self.labels[idx]
-        return {'activation': activations, 'label': label}
+        return {'activation': self.activations[idx], 'label': self.labels[idx]}
 
 
 class BalancedBatchSampler(torch.utils.data.sampler.Sampler):

@@ -1,7 +1,17 @@
 import os
 import torch
 
-def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs, device, checkpoint_dir):
+def train_model(
+    model,
+    train_loader,
+    test_loader,
+    criterion,
+    optimizer,
+    num_epochs,
+    device,
+    checkpoint_dir,
+    verbose=True
+):
     """
     Trains the neural network model, evaluates it on the validation dataset, 
     and saves the best and last checkpoints during training.
@@ -15,6 +25,12 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
         num_epochs (int): Number of epochs to train the model.
         device (str): Device to train on ('cuda' or 'cpu').
         checkpoint_dir (str): Directory to save checkpoints.
+        verbose (bool): If True, prints training and validation progress.
+
+    Returns:
+        tuple: (train_losses, val_accuracies)
+            - train_losses (list of floats): Training losses over epochs.
+            - val_accuracies (list of floats): Validation accuracies over epochs.
 
     Saves:
         - `best_model.pth`: The model with the highest validation accuracy.
@@ -22,6 +38,9 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
     """
     best_accuracy = 0.0
     os.makedirs(checkpoint_dir, exist_ok=True)
+
+    train_losses = []
+    val_accuracies = []
 
     for epoch in range(num_epochs):
         model.train()
@@ -41,7 +60,9 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
             total_samples += activations.size(0)
 
         avg_loss = total_loss / total_samples
-        print(f"Epoch [{epoch + 1}/{num_epochs}], Loss: {avg_loss:.4f}")
+        train_losses.append(avg_loss)
+        if verbose:
+            print(f"Epoch [{epoch + 1}/{num_epochs}], Train Loss: {avg_loss:.4f}")
 
         # Validation
         model.eval()
@@ -58,16 +79,22 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
                 correct += (predicted == labels).sum().item()
 
         accuracy = correct / total * 100
-        print(f"Validation Accuracy: {accuracy:.2f}%\n")
+        val_accuracies.append(accuracy)
+        if verbose:
+            print(f"Validation Accuracy: {accuracy:.2f}%\n")
 
         # Save the best model
         if accuracy > best_accuracy:
             best_accuracy = accuracy
             best_model_path = os.path.join(checkpoint_dir, 'best_model.pth')
             torch.save(model.state_dict(), best_model_path)
-            print(f"Best model saved with accuracy: {best_accuracy:.2f}%")
+            if verbose:
+                print(f"Best model saved with accuracy: {best_accuracy:.2f}%")
 
     # Save the last model
     last_model_path = os.path.join(checkpoint_dir, 'last_model.pth')
     torch.save(model.state_dict(), last_model_path)
-    print(f"Last model saved at epoch {num_epochs}")
+    if verbose:
+        print(f"Last model saved at epoch {num_epochs}")
+
+    return train_losses, val_accuracies
