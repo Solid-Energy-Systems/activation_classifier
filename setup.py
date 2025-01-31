@@ -14,7 +14,6 @@ setup(
     install_requires=[
         'torch',
         'numpy',
-        'arrangement_puzzle @ git+https://github.com/Solid-Energy-Systems/arrangement_puzzle.git',
     ],
     classifiers=[
         "Programming Language :: Python :: 3",
